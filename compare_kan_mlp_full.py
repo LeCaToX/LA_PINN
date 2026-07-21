@@ -37,6 +37,7 @@ DEFAULT_SEED = 1234
 DEFAULT_WIDTH = 64
 DEFAULT_DEPTH = 4
 DEFAULT_LR = 1.0e-3
+DEFAULT_CHECKPOINT_INTERVAL = 100
 
 
 def seed_everything(seed: int) -> None:
@@ -66,6 +67,99 @@ def scalar(value: Tensor) -> float:
     return float(value.detach().cpu())
 
 
+def cpu_copy(value: Any) -> Any:
+    """Copy checkpoint data to CPU so saving does not require extra GPU memory."""
+    if isinstance(value, Tensor):
+        return value.detach().cpu()
+    if isinstance(value, dict):
+        return {key: cpu_copy(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [cpu_copy(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(cpu_copy(item) for item in value)
+    return value
+
+
+def atomic_torch_save(payload: Dict[str, Any], path: Path) -> None:
+    """Write a checkpoint atomically, preserving the previous one on interruption."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path = path.with_name(f".{path.name}.tmp")
+    torch.save(cpu_copy(payload), temporary_path)
+    temporary_path.replace(path)
+
+
+def atomic_json_save(payload: Dict[str, Any], path: Path) -> None:
+    """Write JSON atomically so a server crash cannot leave a partial report."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path = path.with_name(f".{path.name}.tmp")
+    temporary_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    temporary_path.replace(path)
+
+
+def load_checkpoint(path: Path) -> Dict[str, Any]:
+    """Load a checkpoint across PyTorch versions."""
+    try:
+        return torch.load(path, map_location="cpu", weights_only=False)
+    except TypeError:
+        return torch.load(path, map_location="cpu")
+
+
+def optimizer_to_device(optimizer: torch.optim.Optimizer, device: torch.device) -> None:
+    """Move optimizer tensors back to the active GPU after loading a checkpoint."""
+    for state in optimizer.state.values():
+        for key, value in state.items():
+            if isinstance(value, Tensor):
+                state[key] = value.to(device=device)
+
+
+def restore_model_state(model: nn.Module, state_dict: Dict[str, Tensor]) -> None:
+    """Restore a model, including a KAN that was saved after grid refinement."""
+    if isinstance(model, KAN):
+        spline_weights = [
+            value for key, value in state_dict.items() if key.endswith("spline_weight")
+        ]
+        if spline_weights:
+            saved_grid = int(spline_weights[0].shape[-1]) - 3
+            current_grid = model.layers[0].grid_size
+            if saved_grid > current_grid:
+                model.refine_grid(saved_grid)
+    model.load_state_dict(state_dict)
+
+
+def save_training_checkpoint(
+    path: Path,
+    model: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    config: Dict[str, Any],
+    phase: str,
+    adam_epoch: int,
+    lbfgs_iteration: int,
+    histories: Dict[str, List[float]],
+    best_loss: float,
+    best_step: int,
+    elapsed_seconds: float,
+    complete: bool = False,
+    result: Dict[str, Any] | None = None,
+) -> None:
+    payload: Dict[str, Any] = {
+        "checkpoint_version": 1,
+        "complete": complete,
+        "config": config,
+        "phase": phase,
+        "adam_epoch": adam_epoch,
+        "lbfgs_iteration": lbfgs_iteration,
+        "model_state_dict": model.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+        "histories": histories,
+        "best_loss": best_loss,
+        "best_step": best_step,
+        "elapsed_seconds": elapsed_seconds,
+    }
+    if result is not None:
+        payload["result"] = result
+    atomic_torch_save(payload, path)
+
+
 def train_model(
     model: nn.Module,
     loss_fn: Callable[[], Tuple[Tensor, Dict[str, Tensor]]],
@@ -75,42 +169,125 @@ def train_model(
     lr: float,
     grid_schedule: Sequence[Tuple[int, int]],
     checkpoint_path: Path,
+    progress_path: Path,
+    resume: bool,
+    checkpoint_interval: int,
 ) -> Dict[str, Any]:
-    """Train one model with the production Adam/L-BFGS schedule."""
+    """Train one model with crash-safe Adam/L-BFGS checkpoints."""
+    if checkpoint_interval < 1:
+        raise ValueError("checkpoint_interval must be at least 1")
+
     parameter_count = sum(parameter.numel() for parameter in model.parameters())
     histories: Dict[str, List[float]] = {"adam": [], "lbfgs": []}
     best_loss = float("inf")
     best_step = 0
+    elapsed_before_restart = 0.0
+    phase = "adam"
+    adam_epoch = 0
+    lbfgs_iteration = 0
+    progress: Dict[str, Any] | None = None
+    config = {
+        "label": label,
+        "parameters": parameter_count,
+        "n_adam": n_adam,
+        "n_lbfgs": n_lbfgs,
+        "lr": lr,
+        "grid_schedule": list(grid_schedule),
+    }
+
+    if resume and progress_path.exists():
+        candidate = load_checkpoint(progress_path)
+        if candidate.get("config") == config:
+            progress = candidate
+            if candidate.get("complete"):
+                print(f"{label}: completed checkpoint found; skipping.")
+                return candidate["result"]
+            print(
+                f"{label}: restoring from {progress_path.name} "
+                f"(phase={candidate.get('phase')}, "
+                f"Adam={candidate.get('adam_epoch', 0)}, "
+                f"L-BFGS={candidate.get('lbfgs_iteration', 0)})"
+            )
+        else:
+            print(f"{label}: checkpoint settings changed; starting a new run.")
+
+    if progress is not None:
+        restore_model_state(model, progress["model_state_dict"])
+        histories = {
+            key: list(values) for key, values in progress.get("histories", histories).items()
+        }
+        best_loss = float(progress.get("best_loss", best_loss))
+        best_step = int(progress.get("best_step", best_step))
+        elapsed_before_restart = float(progress.get("elapsed_seconds", 0.0))
+        phase = str(progress.get("phase", "adam"))
+        adam_epoch = int(progress.get("adam_epoch", 0))
+        lbfgs_iteration = int(progress.get("lbfgs_iteration", 0))
+
     start_time = time.perf_counter()
 
-    adam = torch.optim.Adam(model.parameters(), lr=lr)
+    def elapsed() -> float:
+        return elapsed_before_restart + time.perf_counter() - start_time
+
+    adam: torch.optim.Optimizer | None = None
     grid_schedule_dict = dict(grid_schedule)
 
-    print(f"\n--- {label}: Adam ({n_adam} steps) ---")
-    for epoch in range(1, n_adam + 1):
-        adam.zero_grad(set_to_none=True)
-        loss, info = loss_fn()
-        loss.backward()
-        adam.step()
+    if phase == "adam":
+        adam = torch.optim.Adam(model.parameters(), lr=lr)
+        if progress is not None and progress.get("optimizer_state_dict"):
+            adam.load_state_dict(progress["optimizer_state_dict"])
+            optimizer_to_device(adam, next(model.parameters()).device)
 
-        loss_value = scalar(loss)
-        histories["adam"].append(loss_value)
-        if loss_value < best_loss:
-            best_loss = loss_value
-            best_step = epoch
+        print(
+            f"\n--- {label}: Adam ({n_adam} steps, "
+            f"starting at {adam_epoch}) ---"
+        )
+        for epoch in range(adam_epoch + 1, n_adam + 1):
+            adam.zero_grad(set_to_none=True)
+            loss, info = loss_fn()
+            loss.backward()
+            adam.step()
 
-        if epoch in grid_schedule_dict and isinstance(model, KAN):
-            new_grid = grid_schedule_dict[epoch]
-            print(f"{label}: refining cubic B-spline grid to {new_grid} intervals")
-            model.refine_grid(new_grid)
-            # Refinement replaces spline tensors, so restart Adam's moments.
-            adam = torch.optim.Adam(model.parameters(), lr=lr)
+            loss_value = scalar(loss)
+            histories["adam"].append(loss_value)
+            if loss_value < best_loss:
+                best_loss = loss_value
+                best_step = epoch
 
-        if epoch % 100 == 0 or epoch == 1:
-            print(
-                f"{label} | Adam {epoch:5d} | lambda = {loss_value:.8f} | "
-                f"elapsed = {time.perf_counter() - start_time:.1f}s"
-            )
+            # Save after refinement. If a crash happens before this point,
+            # the preceding checkpoint will replay this epoch and refine safely.
+            if epoch in grid_schedule_dict and isinstance(model, KAN):
+                new_grid = grid_schedule_dict[epoch]
+                print(f"{label}: refining cubic B-spline grid to {new_grid} intervals")
+                model.refine_grid(new_grid)
+                # Refinement replaces spline tensors, so restart Adam's moments.
+                adam = torch.optim.Adam(model.parameters(), lr=lr)
+
+            if epoch % 100 == 0 or epoch == 1:
+                print(
+                    f"{label} | Adam {epoch:5d} | lambda = {loss_value:.8f} | "
+                    f"elapsed = {elapsed():.1f}s"
+                )
+
+            if epoch % checkpoint_interval == 0 or epoch == n_adam:
+                save_training_checkpoint(
+                    progress_path,
+                    model,
+                    adam,
+                    config,
+                    "adam",
+                    epoch,
+                    0,
+                    histories,
+                    best_loss,
+                    best_step,
+                    elapsed(),
+                )
+
+            del loss, info
+
+        phase = "lbfgs"
+        adam_epoch = n_adam
+        lbfgs_iteration = 0
 
     print(f"--- {label}: L-BFGS ({n_lbfgs} steps) ---")
     lbfgs = torch.optim.LBFGS(
@@ -123,8 +300,29 @@ def train_model(
         history_size=100,
         line_search_fn="strong_wolfe",
     )
+    if progress is not None and phase == "lbfgs" and progress.get("optimizer_state_dict"):
+        lbfgs.load_state_dict(progress["optimizer_state_dict"])
+        optimizer_to_device(lbfgs, next(model.parameters()).device)
 
-    for iteration in range(1, n_lbfgs + 1):
+    # Checkpointing L-BFGS more often than Adam limits lost work without
+    # writing a large optimizer history to disk on every iteration.
+    lbfgs_checkpoint_interval = max(1, min(25, checkpoint_interval))
+    if progress is None or progress.get("phase") != "lbfgs":
+        save_training_checkpoint(
+            progress_path,
+            model,
+            lbfgs,
+            config,
+            "lbfgs",
+            adam_epoch,
+            0,
+            histories,
+            best_loss,
+            best_step,
+            elapsed(),
+        )
+
+    for iteration in range(lbfgs_iteration + 1, n_lbfgs + 1):
         def closure() -> Tensor:
             lbfgs.zero_grad(set_to_none=True)
             closure_loss, _ = loss_fn()
@@ -133,7 +331,12 @@ def train_model(
 
         lbfgs.step(closure)
 
-        if iteration % 25 == 0 or iteration == n_lbfgs:
+        should_evaluate = (
+            iteration % 25 == 0
+            or iteration % lbfgs_checkpoint_interval == 0
+            or iteration == n_lbfgs
+        )
+        if should_evaluate:
             loss, _ = loss_fn()
             loss_value = scalar(loss)
             histories["lbfgs"].append(loss_value)
@@ -143,32 +346,76 @@ def train_model(
                 best_step = global_step
             print(
                 f"{label} | L-BFGS {iteration:5d} | lambda = {loss_value:.8f} | "
-                f"elapsed = {time.perf_counter() - start_time:.1f}s"
+                f"elapsed = {elapsed():.1f}s"
             )
 
+            if iteration % lbfgs_checkpoint_interval == 0 or iteration == n_lbfgs:
+                save_training_checkpoint(
+                    progress_path,
+                    model,
+                    lbfgs,
+                    config,
+                    "lbfgs",
+                    adam_epoch,
+                    iteration,
+                    histories,
+                    best_loss,
+                    best_step,
+                    elapsed(),
+                )
+            del loss
+
     final_loss, final_info = loss_fn()
-    elapsed = time.perf_counter() - start_time
-    torch.save(
-        {
-            "model_state_dict": model.state_dict(),
-            "parameters": parameter_count,
-            "best_loss": best_loss,
-            "best_step": best_step,
-        },
-        checkpoint_path,
-    )
+    final_loss_value = scalar(final_loss)
+    if final_loss_value < best_loss:
+        best_loss = final_loss_value
+        best_step = n_adam + n_lbfgs
+    elapsed_seconds = elapsed()
 
     result: Dict[str, Any] = {
         "label": label,
         "parameters": parameter_count,
         "best_loss": best_loss,
         "best_step": best_step,
-        "final_loss": scalar(final_loss),
-        "seconds": elapsed,
+        "final_loss": final_loss_value,
+        "seconds": elapsed_seconds,
         "final_info": {key: scalar(value) for key, value in final_info.items()},
         "history": histories,
         "checkpoint": str(checkpoint_path),
+        "progress_checkpoint": str(progress_path),
     }
+
+    save_training_checkpoint(
+        checkpoint_path,
+        model,
+        lbfgs,
+        config,
+        "complete",
+        n_adam,
+        n_lbfgs,
+        histories,
+        best_loss,
+        best_step,
+        elapsed_seconds,
+        complete=True,
+        result=result,
+    )
+    save_training_checkpoint(
+        progress_path,
+        model,
+        lbfgs,
+        config,
+        "complete",
+        n_adam,
+        n_lbfgs,
+        histories,
+        best_loss,
+        best_step,
+        elapsed_seconds,
+        complete=True,
+        result=result,
+    )
+    del final_loss, final_info
     return result
 
 
@@ -182,7 +429,11 @@ def compare_pair(
     lr: float,
     grid_schedule: Sequence[Tuple[int, int]],
     output_dir: Path,
+    resume: bool,
+    checkpoint_interval: int,
 ) -> Dict[str, Any]:
+    mlp_checkpoint = output_dir / f"{name}_MLP.pt"
+    mlp_progress = output_dir / f"{name}_MLP.progress.pt"
     mlp_result = train_model(
         mlp,
         loss_builder(mlp),
@@ -191,8 +442,17 @@ def compare_pair(
         n_lbfgs,
         lr,
         (),
-        output_dir / f"{name}_MLP.pt",
+        mlp_checkpoint,
+        mlp_progress,
+        resume,
+        checkpoint_interval,
     )
+    del mlp
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    kan_checkpoint = output_dir / f"{name}_KAN.pt"
+    kan_progress = output_dir / f"{name}_KAN.progress.pt"
     kan_result = train_model(
         kan,
         loss_builder(kan),
@@ -201,8 +461,14 @@ def compare_pair(
         n_lbfgs,
         lr,
         grid_schedule,
-        output_dir / f"{name}_KAN.pt",
+        kan_checkpoint,
+        kan_progress,
+        resume,
+        checkpoint_interval,
     )
+    del kan
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
     mlp_result_loss = mlp_result["final_loss"]
     kan_result_loss = kan_result["final_loss"]
     mlp_best = mlp_result["best_loss"]
@@ -219,7 +485,13 @@ def compare_pair(
     }
 
 
-def run_plate(args: argparse.Namespace, output_dir: Path) -> Dict[str, Any]:
+def run_plate(
+    args: argparse.Namespace,
+    output_dir: Path,
+    resume: bool,
+    report: Dict[str, Any] | None = None,
+    report_path: Path | None = None,
+) -> Dict[str, Any]:
     results: Dict[str, Any] = {}
     dtype = plate.DTYPE
     device = plate.DEVICE
@@ -263,11 +535,22 @@ def run_plate(args: argparse.Namespace, output_dir: Path) -> Dict[str, Any]:
             args.lr,
             grid_schedule,
             output_dir,
+            resume,
+            args.checkpoint_interval,
         )
+        if report is not None and report_path is not None:
+            report["results"]["plate"] = results
+            atomic_json_save(report, report_path)
     return results
 
 
-def run_cube(args: argparse.Namespace, output_dir: Path) -> Dict[str, Any]:
+def run_cube(
+    args: argparse.Namespace,
+    output_dir: Path,
+    resume: bool,
+    report: Dict[str, Any] | None = None,
+    report_path: Path | None = None,
+) -> Dict[str, Any]:
     seed_everything(args.seed)
     problem = cube.Problem()
     problem.a = 1.0
@@ -299,7 +582,7 @@ def run_cube(args: argparse.Namespace, output_dir: Path) -> Dict[str, Any]:
         dtype=dtype,
     )
 
-    return compare_pair(
+    result = compare_pair(
         "cube",
         mlp,
         kan,
@@ -309,7 +592,13 @@ def run_cube(args: argparse.Namespace, output_dir: Path) -> Dict[str, Any]:
         args.lr,
         grid_schedule,
         output_dir,
+        resume,
+        args.checkpoint_interval,
     )
+    if report is not None and report_path is not None:
+        report["results"]["cube"] = result
+        atomic_json_save(report, report_path)
+    return result
 
 
 def parse_args() -> argparse.Namespace:
@@ -327,7 +616,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--cube-gauss", type=int, default=2)
     parser.add_argument("--cube-adam", type=int, default=5000)
     parser.add_argument("--cube-lbfgs", type=int, default=1000)
+    parser.add_argument(
+        "--checkpoint-interval",
+        type=int,
+        default=DEFAULT_CHECKPOINT_INTERVAL,
+        help="Save a restart checkpoint every N Adam steps and up to every 25 L-BFGS steps.",
+    )
     parser.add_argument("--output-dir", type=Path, default=Path("comparison_full_results"))
+    parser.add_argument(
+        "--fresh",
+        action="store_true",
+        help="Ignore existing progress checkpoints and start the comparison from scratch.",
+    )
     return parser.parse_args()
 
 
@@ -338,23 +638,50 @@ def main() -> None:
             "CUDA is required for the full comparison. Run this script on the GPU machine."
         )
 
+    if args.checkpoint_interval < 1:
+        raise ValueError("--checkpoint-interval must be at least 1")
+
     args.output_dir.mkdir(parents=True, exist_ok=True)
-    report: Dict[str, Any] = {
-        "settings": vars(args) | {"device": str(torch.cuda.get_device_name(0))},
-        "results": {},
-    }
-    report["settings"] = {
+    report_path = args.output_dir / "comparison_report.json"
+    settings = {
         key: str(value) if isinstance(value, Path) else value
-        for key, value in report["settings"].items()
+        for key, value in vars(args).items()
+        if key != "fresh"
     }
+    settings["device"] = str(torch.cuda.get_device_name(0))
+
+    report: Dict[str, Any] = {"settings": settings, "results": {}}
+    if not args.fresh and report_path.exists():
+        try:
+            previous_report = json.loads(report_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            previous_report = None
+        if isinstance(previous_report, dict) and previous_report.get("settings") == settings:
+            report = previous_report
+            report.setdefault("results", {})
+            print(f"Restoring progress recorded in {report_path}")
+
+    # Make even the initial empty report durable before expensive training starts.
+    atomic_json_save(report, report_path)
 
     if args.problem in ("plate", "both"):
-        report["results"]["plate"] = run_plate(args, args.output_dir)
+        report["results"]["plate"] = run_plate(
+            args,
+            args.output_dir,
+            resume=not args.fresh,
+            report=report,
+            report_path=report_path,
+        )
     if args.problem in ("cube", "both"):
-        report["results"]["cube"] = run_cube(args, args.output_dir)
+        report["results"]["cube"] = run_cube(
+            args,
+            args.output_dir,
+            resume=not args.fresh,
+            report=report,
+            report_path=report_path,
+        )
 
-    report_path = args.output_dir / "comparison_report.json"
-    report_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
+    atomic_json_save(report, report_path)
     print(f"\nSaved comparison report to {report_path.resolve()}")
 
 
