@@ -12,5 +12,5 @@ if [[ "$#" -eq 0 ]]; then
     set -- compare_kan_mlp_full.py --problem both
 fi
 
-python -c 'import torch; print(f"CUDA available: {torch.cuda.is_available()}"); print(f"GPU: {torch.cuda.get_device_name(0) if torch.cuda.is_available() else \"none\"}")'
+python -c 'import torch; ok=torch.cuda.is_available(); print("CUDA available:", ok); print("GPU:", torch.cuda.get_device_name(0) if ok else "none")'
 exec python "$@"
