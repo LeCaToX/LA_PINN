@@ -1,0 +1,7 @@
+# Core numerical and plotting dependencies
+numpy>=1.24
+matplotlib>=3.7
+
+# PyTorch is required by the KAN models and comparison runner.
+# Install the CUDA-enabled build appropriate for your GPU from pytorch.org.
+torch>=2.1
