@@ -17,19 +17,25 @@ export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:T
 export MPLBACKEND="${MPLBACKEND:-Agg}"
 
 echo "=== Plate comparison on GPU 0: Gauss 2, 3, 5 ==="
-CUDA_VISIBLE_DEVICES=0 python -u compare_kan_mlp_full.py \
+if ! CUDA_VISIBLE_DEVICES=0 python -u compare_kan_mlp_full.py \
     --problem plate \
     --output-dir "$OUTPUT_DIR" \
-    "$@" > "$OUTPUT_DIR/plate_run.log" 2>&1
+    "$@" 2>&1 | tee "$OUTPUT_DIR/plate_run.log"; then
+    echo "Plate comparison failed. See $OUTPUT_DIR/plate_run.log"
+    exit 1
+fi
 
 echo "=== Sharded cube comparison on GPUs 0 and 1 ==="
-CUDA_VISIBLE_DEVICES=0,1 torchrun \
+if ! CUDA_VISIBLE_DEVICES=0,1 torchrun \
     --standalone \
     --nproc_per_node=2 \
     compare_cube_2gpu.py \
     --output-dir "$CUBE_DIR" \
     --legacy-dir "$OUTPUT_DIR" \
-    "$@" > "$CUBE_DIR/run.log" 2>&1
+    "$@" 2>&1 | tee "$CUBE_DIR/run.log"; then
+    echo "Sharded cube comparison failed. See $CUBE_DIR/run.log"
+    exit 1
+fi
 
 python merge_full_2gpu_reports.py \
     --plate-dir "$OUTPUT_DIR" \
