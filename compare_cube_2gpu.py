@@ -343,7 +343,7 @@ def train_model(
 
         if is_rank_zero(rank):
             print(f"\n--- {label}: Adam ({args.adam} steps, starting at {adam_epoch}) ---")
-        grid_schedule = {1500: 9, 3500: 13}
+        grid_schedule = {1500: 9, 3500: 13} if kind == "KAN" else {}
         for epoch in range(adam_epoch + 1, args.adam + 1):
             optimizer.zero_grad(set_to_none=True)
             loss, info = loss_fn()
