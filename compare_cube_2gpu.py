@@ -77,10 +77,16 @@ def load_checkpoint(path: Path) -> Dict[str, Any]:
 
 
 def optimizer_to_device(optimizer: torch.optim.Optimizer, device: torch.device) -> None:
+    parameter_dtype = None
+    if optimizer.param_groups and optimizer.param_groups[0]["params"]:
+        parameter_dtype = optimizer.param_groups[0]["params"][0].dtype
     for state in optimizer.state.values():
         for key, value in state.items():
             if isinstance(value, torch.Tensor):
-                state[key] = value.to(device=device)
+                if parameter_dtype is not None and value.is_floating_point():
+                    state[key] = value.to(device=device, dtype=parameter_dtype)
+                else:
+                    state[key] = value.to(device=device)
 
 
 def build_mlp(in_dim: int, out_dim: int, width: int, depth: int, device: torch.device) -> nn.Module:
@@ -255,22 +261,34 @@ def train_model(
     }
 
     progress: Dict[str, Any] | None = None
-    if args.resume and progress_path.exists():
-        candidate = load_checkpoint(progress_path)
-        if candidate.get("config") == config:
-            progress = candidate
-            if candidate.get("complete"):
+    progress_source: Path | None = None
+    if args.resume:
+        checkpoint_candidates = [progress_path]
+        if args.legacy_dir is not None:
+            checkpoint_candidates.append(args.legacy_dir / f"cube_{kind}.progress.pt")
+        for candidate_path in checkpoint_candidates:
+            if not candidate_path.exists():
+                continue
+            candidate = load_checkpoint(candidate_path)
+            is_legacy = candidate_path != progress_path
+            if candidate.get("config") == config or is_legacy:
+                progress = candidate
+                progress_source = candidate_path
+                if candidate.get("complete"):
+                    if is_rank_zero(rank):
+                        print(f"{label}: completed checkpoint found; skipping.")
+                    return candidate["result"]
                 if is_rank_zero(rank):
-                    print(f"{label}: completed checkpoint found; skipping.")
-                return candidate["result"]
+                    source_note = " (legacy checkpoint)" if is_legacy else ""
+                    print(
+                        f"{label}: restoring{source_note} "
+                        f"phase={candidate.get('phase')} "
+                        f"Adam={candidate.get('adam_epoch', 0)} "
+                        f"L-BFGS={candidate.get('lbfgs_iteration', 0)}"
+                    )
+                break
             if is_rank_zero(rank):
-                print(
-                    f"{label}: restoring phase={candidate.get('phase')} "
-                    f"Adam={candidate.get('adam_epoch', 0)} "
-                    f"L-BFGS={candidate.get('lbfgs_iteration', 0)}"
-                )
-        elif is_rank_zero(rank):
-            print(f"{label}: checkpoint settings changed; starting fresh.")
+                print(f"{label}: checkpoint settings changed; starting fresh.")
 
     seed_everything(args.seed)
     if kind == "MLP":
@@ -526,6 +544,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=DEFAULT_SEED)
     parser.add_argument("--checkpoint-interval", type=int, default=DEFAULT_CHECKPOINT_INTERVAL)
     parser.add_argument("--output-dir", type=Path, default=Path("comparison_cube_2gpu"))
+    parser.add_argument("--legacy-dir", type=Path, default=None)
     parser.add_argument("--fresh", action="store_true")
     return parser.parse_args()
 
