@@ -3,7 +3,13 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 OUTPUT_DIR="${OUTPUT_DIR:-$ROOT_DIR/comparison_full_results}"
-CUBE_DIR="$OUTPUT_DIR/cube_2gpu"
+if [[ -n "${CUBE_DIR:-}" ]]; then
+    :
+elif [[ -d "$ROOT_DIR/comparison_cube_2gpu" ]]; then
+    CUBE_DIR="$ROOT_DIR/comparison_cube_2gpu"
+else
+    CUBE_DIR="$OUTPUT_DIR/cube_2gpu"
+fi
 mkdir -p "$OUTPUT_DIR" "$CUBE_DIR"
 cd "$ROOT_DIR"
 
@@ -23,7 +29,7 @@ CUDA_VISIBLE_DEVICES=0,1 torchrun \
     compare_cube_2gpu.py \
     --output-dir "$CUBE_DIR" \
     --legacy-dir "$OUTPUT_DIR" \
-    "$@" > "$OUTPUT_DIR/cube/run.log" 2>&1
+    "$@" > "$CUBE_DIR/run.log" 2>&1
 
 python merge_full_2gpu_reports.py \
     --plate-dir "$OUTPUT_DIR" \
