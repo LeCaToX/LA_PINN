@@ -103,6 +103,7 @@ def build_model(kind: str, in_dim: int, out_dim: int, width: int, depth: int, sc
 
 
 LossFactory = Callable[[], tuple[Tensor, dict[str, Tensor]]]
+BackwardFactory = Callable[[], tuple[Tensor, dict[str, Tensor]]]
 
 
 def train_with_checkpoint(
@@ -115,10 +116,14 @@ def train_with_checkpoint(
     lr: float,
     epoch_offset: int = 0,
     save_every: int = 100,
+    backward_factory: BackwardFactory | None = None,
+    evaluate_factory: LossFactory | None = None,
 ) -> tuple[nn.Module, list[int], list[float]]:
     """Train Adam then L-BFGS and resume from a compact checkpoint."""
 
     checkpoint = output_dir / checkpoint_name
+    if evaluate_factory is None:
+        evaluate_factory = loss_factory
     history_iter: list[int] = []
     history_loss: list[float] = []
     phase = "adam"
@@ -148,8 +153,11 @@ def train_with_checkpoint(
             optimizer_to_device(adam)
         for epoch in range(step + 1, n_adam + 1):
             adam.zero_grad(set_to_none=True)
-            loss, info = loss_factory()
-            loss.backward()
+            if backward_factory is None:
+                loss, info = loss_factory()
+                loss.backward()
+            else:
+                loss, info = backward_factory()
             adam.step()
             history_iter.append(epoch_offset + epoch)
             history_loss.append(float(loss.detach().cpu()))
@@ -183,13 +191,16 @@ def train_with_checkpoint(
         for iteration in range(step + 1, n_lbfgs + 1):
             def closure() -> Tensor:
                 lbfgs.zero_grad(set_to_none=True)
-                value, _ = loss_factory()
-                value.backward()
+                if backward_factory is None:
+                    value, _ = loss_factory()
+                    value.backward()
+                else:
+                    value, _ = backward_factory()
                 return value
 
             lbfgs.step(closure)
             if iteration % 25 == 0 or iteration == n_lbfgs:
-                value, _ = loss_factory()
+                value, _ = evaluate_factory()
                 history_iter.append(epoch_offset + n_adam + iteration)
                 history_loss.append(float(value.detach().cpu()))
                 print(f"LBFGS {iteration:5d} | lambda = {float(value.detach().cpu()):.8f}")
@@ -236,6 +247,33 @@ def plate_nodes_dissipation(net: nn.Module, prob, shear_factor: float) -> np.nda
     return (SIGMA0 * torch.sqrt(torch.clamp(quad, min=1.0e-18))).detach().cpu().numpy().ravel()
 
 
+def plate_loss_chunked(
+    net: nn.Module,
+    prob,
+    shear_factor: float,
+    chunk_size: int,
+    backward: bool,
+) -> tuple[Tensor, dict[str, Tensor]]:
+    """Evaluate plate loss in chunks to bound the spatial-autograd graph."""
+
+    wraw = plate.external_work(net, prob)
+    alpha = 1.0 / (torch.abs(wraw) + 1.0e-12)
+    total_value = 0.0
+    n_points = int(prob.Xg.shape[0])
+    for start in range(0, n_points, chunk_size):
+        stop = min(start + chunk_size, n_points)
+        X = prob.Xg[start:stop].detach().clone().requires_grad_(True)
+        d = alpha * plate.hard_bc(X, net(X))
+        eps = plate.strain_rate(X, d)
+        exx, eyy, gxy = eps[:, 0:1], eps[:, 1:2], eps[:, 2:3]
+        quad = (4.0 / 3.0) * (exx.square() + eyy.square() + exx * eyy) + shear_factor * gxy.square()
+        loss_chunk = torch.sum(SIGMA0 * torch.sqrt(torch.clamp(quad, min=1.0e-18)) * prob.Wg[start:stop])
+        total_value += float(loss_chunk.detach().cpu())
+        if backward:
+            loss_chunk.backward(retain_graph=stop < n_points)
+    return torch.tensor(total_value, dtype=DTYPE, device=DEVICE), {"Wraw": wraw.detach(), "alpha": alpha.detach()}
+
+
 def save_plate_plots(prob, Dnode: np.ndarray, iterations: Sequence[int], values: Sequence[float], output_dir: Path, prefix: str) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     tris = np.empty((2 * prob.elem.shape[0], 3), dtype=np.int64)
@@ -279,6 +317,7 @@ def run_plate_case(
     shear_factor: float = 1.0 / 3.0,
     p2: float = 0.0,
     grid_size: int = 5,
+    chunk_size: int | None = None,
 ) -> tuple[nn.Module, object, list[int], list[float]]:
     seed_everything()
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -286,8 +325,14 @@ def run_plate_case(
     prob = plate.build_problem(prob)
     net = build_model(kind, 2, 2, width, depth, prob.a, grid_size)
     loss_factory = lambda: plate_loss(net, prob, shear_factor)
+    backward_factory = None
+    evaluate_factory = None
+    if chunk_size is not None:
+        backward_factory = lambda: plate_loss_chunked(net, prob, shear_factor, chunk_size, True)
+        evaluate_factory = lambda: plate_loss_chunked(net, prob, shear_factor, chunk_size, False)
     net, iterations, values = train_with_checkpoint(
-        net, loss_factory, output_dir, f"{name}.progress.pt", n_adam, n_lbfgs, lr
+        net, loss_factory, output_dir, f"{name}.progress.pt", n_adam, n_lbfgs, lr,
+        backward_factory=backward_factory, evaluate_factory=evaluate_factory,
     )
     Dnode = plate_nodes_dissipation(net, prob, shear_factor)
     atomic_save(
@@ -317,7 +362,10 @@ def run_high_gauss(output_dir: Path, n_adam: int = 4000, n_lbfgs: int = 300, lr:
 def run_hist_gauss(output_dir: Path, n_adam: int = 4000, n_lbfgs: int = 900, lr: float = 1.0e-3) -> None:
     all_hist: list[tuple[list[int], list[float], int]] = []
     for ngauss in (2, 3, 5):
-        _, _, it, val = run_plate_case(f"plate_g{ngauss}_KAN", output_dir, 80, ngauss, n_adam, n_lbfgs, lr, p2=1.0, grid_size=8)
+        _, _, it, val = run_plate_case(
+            f"plate_g{ngauss}_KAN", output_dir, 80, ngauss, n_adam, n_lbfgs, lr,
+            p2=1.0, grid_size=8, chunk_size=8192,
+        )
         all_hist.append((it, val, ngauss))
         if ngauss == 5:
             shutil.copyfile(output_dir / "plate_g5_KAN_dissipation.pdf", output_dir / "UB_dissipation_gauss_5.pdf")

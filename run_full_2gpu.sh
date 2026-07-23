@@ -54,6 +54,7 @@ run_case() {
     else
         local exit_code=$?
         echo "[$case_name] FAILED with exit code $exit_code; see $log_file" >&2
+        tail -n 40 "$log_file" >&2 || true
         return "$exit_code"
     fi
 }
