@@ -783,7 +783,7 @@ def main() -> None:
             numGauss=ngauss,
         )
         prob = build_problem(prob)
-        if ig == 0:
+        if ngauss == num_gauss_list[0]:
             plot_initial_nodes(prob)
 
         net, iter_hist, lambda_hist = train_one_gauss(

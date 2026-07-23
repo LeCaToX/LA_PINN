@@ -47,7 +47,7 @@ prob.numGauss = 2
 betaInc = 1.0
 
 nAdam  = 5000
-nLBFGS = 1000
+nLBFGS = 550
 lr     = 1e-3
 gridSchedule = {1500: 9, 3500: 13}
 
