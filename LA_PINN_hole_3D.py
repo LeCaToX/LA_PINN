@@ -695,7 +695,7 @@ def plotDissipation3D(prob, Dnode):
     fig = plt.figure(facecolor="w")
     ax = fig.add_subplot(111, projection="3d")
 
-    cmap = cm.get_cmap("jet", 256)
+    cmap = plt.get_cmap("jet", 256)
     vmin = np.min(Dnode)
     vmax = np.max(Dnode)
 
@@ -756,7 +756,7 @@ def plotDissipation3Views(prob, Dnode):
     titles = ["View 1", "View 2", "View 3"]
 
     fig = plt.figure(facecolor="w", figsize=(12, 3.6))
-    cmap = cm.get_cmap("viridis", 256)
+    cmap = plt.get_cmap("viridis", 256)
 
     vmin = np.min(Dnode)
     vmax = np.max(Dnode)
