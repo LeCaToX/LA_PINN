@@ -782,10 +782,6 @@ def plotDissipation3Views(prob, Dnode):
 
         set_axes_equal(ax)
         ax.view_init(elev=views[iv][1], azim=views[iv][0])
-        ax.set_title(titles[iv], fontname=PAPER_FONT, fontsize=16)
-        ax.set_xlabel("x-axis", fontname=PAPER_FONT)
-        ax.set_ylabel("y-axis", fontname=PAPER_FONT)
-        ax.set_zlabel("z-axis", fontname=PAPER_FONT)
         ax.grid(False)
 
     plt.tight_layout()

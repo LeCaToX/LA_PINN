@@ -120,11 +120,34 @@ def plot_history(
             ax.plot(x, lbfgs, "--", color=color, label=f"{label} L-BFGS")
     ax.set_xlabel("Iteration")
     ax.set_ylabel(r"$\lambda^{+}$")
-    ax.set_title(f"{case_name}: MLP versus KAN")
     ax.grid(True)
+    ax.set_box_aspect(1)
     ax.legend(loc="best")
     fig.tight_layout()
     fig.savefig(output_dir / f"{case_name}_loss_comparison.pdf", bbox_inches="tight")
+    plt.close(fig)
+
+
+def plot_plate_matlab_style(prob: Any, dissipation: np.ndarray, output_path: Path, title: str) -> None:
+    """Python equivalent of the MATLAB trisurf plate plot."""
+    coords = prob.coords
+    elem = prob.elem
+    tris = np.empty((2 * elem.shape[0], 3), dtype=np.int64)
+    tris[0::2] = elem[:, [0, 1, 2]]
+    tris[1::2] = elem[:, [0, 2, 3]]
+    values = np.nan_to_num(np.asarray(dissipation, dtype=float), nan=0.0, posinf=0.0, neginf=0.0)
+    fig, ax = plt.subplots(figsize=(7.0, 6.0), facecolor="white")
+    artist = ax.tripcolor(coords[:, 0], coords[:, 1], tris, values, shading="gouraud", cmap=plt.get_cmap("jet", 256))
+    ax.set_aspect("equal", adjustable="box")
+    ax.autoscale(enable=True, axis="both", tight=True)
+    ax.set_xlabel("x")
+    ax.set_ylabel("y")
+    theta = np.linspace(0.0, np.pi / 2.0, 200)
+    ax.plot(prob.R * np.cos(theta), prob.R * np.sin(theta), "k--", linewidth=1.2)
+    ax.set_title(title)
+    fig.colorbar(artist, ax=ax)
+    fig.tight_layout()
+    fig.savefig(output_path, bbox_inches="tight")
     plt.close(fig)
 
 
@@ -188,11 +211,11 @@ def export_plate(
             (kan, "KAN", kan_payload),
         ):
             dissipation = plate.nodal_dissipation(model, prob, sigma0=1.0)
-            call_plot_in_directory(
-                plate_output,
-                f"UB_dissipation_gauss_{gauss}.pdf",
-                f"{case_name}_{label}_dissipation.pdf",
-                lambda d=dissipation: plate.plot_dissipation(prob, d),
+            plot_plate_matlab_style(
+                prob,
+                dissipation,
+                plate_output / f"{case_name}_{label}_dissipation.pdf",
+                "Normalized upper-bound dissipation",
             )
 
         mlp_result = mlp_payload.get("result", {})

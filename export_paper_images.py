@@ -22,6 +22,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 from paper_style import configure_paper_style
+from export_paper_faithful import export_standalone
 
 
 PAPER_FONT = configure_paper_style()
@@ -207,13 +208,16 @@ def main() -> None:
     records = collect_histories(input_dir)
     summary_paths = [path for path in (plot_histories(records, output_dir), plot_final_lambdas(records, output_dir)) if path]
     comparison_paths = run_comparison_export(Path(__file__).resolve().parent, input_dir, output_dir, pair_dir, cube_dir)
+    faithful_dir = output_dir / "paper_faithful"
+    export_standalone(input_dir, faithful_dir)
 
     manifest = {
         "input_dir": str(input_dir),
         "output_dir": str(output_dir),
         "standalone_pdf_count": len(copied),
         "history_count": len(records),
-        "generated_files": [str(path.relative_to(output_dir)) for path in summary_paths + comparison_paths],
+        "generated_files": [str(path.relative_to(output_dir)) for path in summary_paths + comparison_paths]
+        + [str(path.relative_to(output_dir)) for path in faithful_dir.rglob("*.pdf")],
     }
     (output_dir / "paper_figures_manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
     print(f"Exported paper figures to {output_dir}")
