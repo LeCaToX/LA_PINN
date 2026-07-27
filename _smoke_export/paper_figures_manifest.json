@@ -1,0 +1,10 @@
+{
+  "input_dir": "C:\\Users\\LeCaToX\\Downloads\\LA_PINN\\_smoke_fast",
+  "output_dir": "C:\\Users\\LeCaToX\\Downloads\\LA_PINN\\_smoke_export",
+  "standalone_pdf_count": 2,
+  "history_count": 1,
+  "generated_files": [
+    "all_case_training_histories.pdf",
+    "all_case_final_lambdas.pdf"
+  ]
+}
