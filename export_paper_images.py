@@ -21,6 +21,10 @@ os.environ.setdefault("MPLBACKEND", "Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
+from paper_style import configure_paper_style
+
+
+PAPER_FONT = configure_paper_style()
 
 
 def load_payload(path: Path) -> dict[str, Any]:
@@ -198,6 +202,7 @@ def main() -> None:
         cube_dir = None
 
     print(f"Reading completed results from {input_dir}")
+    print(f"Paper font selected: {PAPER_FONT}")
     copied = collect_pdfs(input_dir, output_dir)
     records = collect_histories(input_dir)
     summary_paths = [path for path in (plot_histories(records, output_dir), plot_final_lambdas(records, output_dir)) if path]

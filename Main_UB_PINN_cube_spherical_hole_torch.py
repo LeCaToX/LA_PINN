@@ -12,6 +12,7 @@ import torch.nn as nn
 import matplotlib.pyplot as plt
 from matplotlib import cm
 from mpl_toolkits.mplot3d.art3d import Poly3DCollection
+from paper_style import PAPER_FONT
 
 torch.set_default_dtype(torch.float64)
 torch.manual_seed(1234)
@@ -785,10 +786,10 @@ def plotDissipation3Views(prob, Dnode):
 
         set_axes_equal(ax)
         ax.view_init(elev=views[iv][1], azim=views[iv][0])
-        ax.set_title(titles[iv], fontname="Times New Roman", fontsize=16)
-        ax.set_xlabel("x-axis", fontname="Times New Roman")
-        ax.set_ylabel("y-axis", fontname="Times New Roman")
-        ax.set_zlabel("z-axis", fontname="Times New Roman")
+        ax.set_title(titles[iv], fontname=PAPER_FONT, fontsize=16)
+        ax.set_xlabel("x-axis", fontname=PAPER_FONT)
+        ax.set_ylabel("y-axis", fontname=PAPER_FONT)
+        ax.set_zlabel("z-axis", fontname=PAPER_FONT)
         ax.grid(False)
 
     plt.tight_layout()

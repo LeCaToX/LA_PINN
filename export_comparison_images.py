@@ -17,6 +17,10 @@ os.environ.setdefault("MPLBACKEND", "Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
+from paper_style import configure_paper_style
+
+
+PAPER_FONT = configure_paper_style()
 
 
 def load_payload(path: Path) -> Dict[str, Any]:
