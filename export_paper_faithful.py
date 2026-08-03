@@ -38,9 +38,18 @@ def load_payload(path: Path) -> dict:
         return torch.load(path, map_location=DEVICE)
 
 
-def load_local_model(path: Path, kind: str, width: int, depth: int, scale: float, grid_size: int = 5):
+def load_local_model(
+    path: Path,
+    kind: str,
+    in_dim: int,
+    out_dim: int,
+    width: int,
+    depth: int,
+    scale: float,
+    grid_size: int = 5,
+):
     payload = load_payload(path)
-    net = cases.build_model(kind, 2, 2, width, depth, scale, grid_size)
+    net = cases.build_model(kind, in_dim, out_dim, width, depth, scale, grid_size)
     net.load_state_dict(payload["model"])
     net.eval()
     return net, payload
@@ -160,7 +169,7 @@ def export_plate_cases(input_dir: Path, output_dir: Path) -> None:
             print(f"Missing {path}; skipping")
             continue
         prob = plate_prob(nx, gauss, p2)
-        net, payload = load_local_model(path, "kan", width, depth, prob.a, 5)
+        net, payload = load_local_model(path, "kan", 2, 2, width, depth, prob.a, 5)
         dnode = cases.plate_nodes_dissipation(net, prob, shear)
         save_plate_dissipation(prob, dnode, output_dir / f"{prefix}_dissipation.pdf", "main", "Normalized upper-bound dissipation")
         if "iter" in payload and "loss" in payload:
@@ -174,7 +183,7 @@ def export_plate_cases(input_dir: Path, output_dir: Path) -> None:
         if not path.exists():
             continue
         prob = plate_prob(80, gauss, 1.0)
-        net, payload = load_local_model(path, "kan", 64, 4, prob.a, 8)
+        net, payload = load_local_model(path, "kan", 2, 2, 64, 4, prob.a, 8)
         dnode = cases.plate_nodes_dissipation(net, prob, 1.0 / 3.0)
         save_plate_dissipation(prob, dnode, output_dir / f"hist_gauss_{gauss}_dissipation.pdf", "main", f"Normalized upper-bound dissipation, {gauss} x {gauss} Gauss")
         if "iter" in payload and "loss" in payload:
@@ -197,7 +206,7 @@ def export_adaptive(input_dir: Path, output_dir: Path) -> None:
     if not path.exists():
         return
     prob = plate_prob(40, 2, 0.0)
-    net, payload = load_local_model(path, "kan", 64, 4, prob.a, 5)
+    net, payload = load_local_model(path, "kan", 2, 2, 64, 4, prob.a, 5)
     dnode = cases.plate_nodes_dissipation(net, prob, 1.0 / 3.0)
     save_plate_dissipation(prob, dnode, output_dir / "adaptive_Gauss_dissipation.pdf", "adaptive", "Plastic dissipation density")
     hot = np.asarray(payload.get("hot", []), dtype=bool)
@@ -221,8 +230,8 @@ def export_activation(input_dir: Path, output_dir: Path) -> None:
     if not mlp_path.exists() or not kan_path.exists():
         return
     prob = plate_prob(20, 3, 0.0)
-    mlp, mlp_payload = load_local_model(mlp_path, "mlp", 64, 4, prob.a)
-    kan, kan_payload = load_local_model(kan_path, "kan", 64, 4, prob.a, 5)
+    mlp, mlp_payload = load_local_model(mlp_path, "mlp", 2, 2, 64, 4, prob.a)
+    kan, kan_payload = load_local_model(kan_path, "kan", 2, 2, 64, 4, prob.a, 5)
     records = (("MLP-tanh", mlp, mlp_payload), ("cubic B-spline KAN", kan, kan_payload))
     tris = triangles(prob.elem)
     fig, axes = plt.subplots(2, 3, figsize=(12.0, 7.0), facecolor="white")
@@ -260,7 +269,7 @@ def thin_fields(net):
 def export_thin(input_dir: Path, output_dir: Path) -> None:
     path = input_dir / "thin_cylinder" / "thinwall_KAN.pt"
     if not path.exists(): return
-    net, payload = load_local_model(path, "kan", 64, 4, math.pi / 2.0, 5)
+    net, payload = load_local_model(path, "kan", 1, 2, 64, 4, math.pi / 2.0, 5)
     theta, u, v, D = thin_fields(net); a = 1.0
     fig, ax = plt.subplots(facecolor="white"); ax.plot(theta, D, linewidth=2); ax.set_xlabel(r"$\theta$"); ax.set_ylabel("Plastic dissipation"); ax.grid(True); ax.set_box_aspect(1); fig.tight_layout(); fig.savefig(output_dir / "thinwall_dissipation.pdf", bbox_inches="tight"); plt.close(fig)
     fig, ax = plt.subplots(facecolor="white"); t = np.linspace(0, math.pi/2, 400); ax.plot(a*np.cos(t), a*np.sin(t), "k-", linewidth=2); ax.quiver(a*np.cos(theta), a*np.sin(theta), u, v, color="r", width=0.003); ax.set_aspect("equal"); ax.set_xlabel("x"); ax.set_ylabel("y"); ax.grid(True); ax.set_title("Thin-wall collapse mechanism"); fig.tight_layout(); fig.savefig(output_dir / "thinwall_velocity.pdf", bbox_inches="tight"); plt.close(fig)
@@ -278,7 +287,7 @@ def export_thick(input_dir: Path, output_dir: Path) -> None:
     for ratio in (0.3, 0.4, 0.5, 0.6, 0.7, 0.8):
         tag = f"ab_{round(100*ratio):03d}"; path = folder / f"{tag}_KAN.pt"
         if not path.exists(): continue
-        prob = make_thick_problem(ratio); net, payload = load_local_model(path, "kan", 64, 4, prob.b, 5); dnode = cases.thick_node_dissipation(net, prob)
+        prob = make_thick_problem(ratio); net, payload = load_local_model(path, "kan", 2, 2, 64, 4, prob.b, 5); dnode = cases.thick_node_dissipation(net, prob)
         tris = triangles(prob.elem); vmin, vmax = np.percentile(np.nan_to_num(dnode), [5,97]); values=np.clip(np.nan_to_num(dnode),vmin,vmax)
         fig, ax = plt.subplots(facecolor="white"); ax.tripcolor(prob.node[:,0], prob.node[:,1], tris, values, shading="gouraud", cmap=plt.get_cmap("jet",256), vmin=vmin, vmax=vmax); ax.set_aspect("equal"); ax.axis("off"); fig.colorbar(ax.collections[0], ax=ax); fig.tight_layout(); fig.savefig(output_dir / f"thick_diss_{tag}.pdf", bbox_inches="tight"); plt.close(fig)
         fig, ax = plt.subplots(facecolor="white"); ax.add_collection(PolyCollection([prob.node[e] for e in prob.elem], facecolor=[0.85,0.85,0.85], edgecolor="none", alpha=0.7)); wraw=cases.thick_external(net,prob); alpha=torch.where(wraw<0,-1.,1.)/(torch.abs(wraw)+1e-12); X=torch.as_tensor(prob.node,dtype=DTYPE,device=DEVICE); fields=(alpha*cases.plate.hard_bc(X,net(X))).detach().cpu().numpy(); node_def=prob.node+0.2*fields; ax.add_collection(PolyCollection([node_def[e] for e in prob.elem], facecolor="none", edgecolor="r", linewidth=0.4)); ax.quiver(prob.node[:,0],prob.node[:,1],fields[:,0],fields[:,1],color="k",width=0.0015); ax.autoscale(); ax.set_aspect("equal"); ax.axis("off"); ax.set_title(f"Velocity mechanism, a/b = {ratio:.1f}"); fig.tight_layout(); fig.savefig(output_dir / f"velocity_{tag}.pdf", bbox_inches="tight"); plt.close(fig)
